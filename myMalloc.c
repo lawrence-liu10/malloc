@@ -216,12 +216,14 @@ static inline header * allocate_object(size_t raw_size) {
     // if ilist > N_LISTS - 1, we need to loop through last list to find a block big enough
     if (ilist >= N_LISTS - 1) {
       freelist = &freelistSentinels[N_LISTS - 1];
-      while (freelist->next != &freelistSentinels[N_LISTS - 1]) {
-        if (get_size(freelist->next) >= total_size) {
-          current = freelist->next;
+      header * block = freelist->next;
+      while (block != freelist) {
+        if (get_size(block) >= total_size) {
+          current = block;
           ilist = N_LISTS - 1;
           break;
         }
+        block = block->next;
       }
     }
     else { // ilist is within bounds, just find the next list large enough
@@ -238,82 +240,54 @@ static inline header * allocate_object(size_t raw_size) {
     if (current == NULL) {
       header * new_chunk = allocate_chunk(ARENA_SIZE);
       if (!new_chunk) {
-        return NULL;
+          return NULL;
       }
 
       header * left_fp = get_left_header(new_chunk);
       header * right_fp = get_right_header(new_chunk);
 
-      // check adjacency
-      header * left_left_fp = get_left_header(left_fp);
+      int adjacent = (lastFencePost && (get_right_header(lastFencePost) == left_fp));
 
-      // coalesce (contiguous memory)
-      if (left_left_fp == lastFencePost) {
-        header * last_block_in_old_mem = get_left_header(lastFencePost);
-        size_t last_old_block_size = 0;
-        int moved_lists = 0;
-        
-        if (get_state(last_block_in_old_mem) == UNALLOCATED) {
-          last_old_block_size = get_size(last_block_in_old_mem);
-          int old_idx = (last_old_block_size / 8) - 3;
-          if (old_idx >= N_LISTS - 1) {
-            moved_lists = 1;
-          }
-          else {
-            remove_header_from_freelist(last_block_in_old_mem);
-          }
-        }
+      if (adjacent) {
+        header * last_block = get_left_header(lastFencePost);
+        size_t new_size;
 
-        // coalesce only if prev block unallocated
-        size_t new_size = get_size(new_chunk);
-        if (last_old_block_size > 0) {
-          new_size += last_old_block_size;
-        } else {
-          // Only coalesce fenceposts when previous block is allocated
-          new_size = ARENA_SIZE;
-          header * new_block = lastFencePost;
-          set_size(new_block, new_size);
-          set_state(new_block, UNALLOCATED);
-          
-          // Create new right fencepost
-          header * new_right_fp = get_header_from_offset(new_block, new_size);
-          initialize_fencepost(new_right_fp, new_size);
-          new_right_fp->left_size = new_size;
+        // only coalesce if last block is unallocated
+        if (get_state(last_block) == UNALLOCATED) {
+          remove_header_from_freelist(last_block);
 
-          lastFencePost = new_right_fp;
-          insert_header_to_freelist(new_block, N_LISTS - 1);
-          continue;  // Restart loop to find free block
-        }
+          //fix sizes
+          new_size = get_size(last_block) + ARENA_SIZE;
+          set_size(last_block, new_size);
+          right_fp->left_size = new_size;
+          lastFencePost = right_fp;
 
-        header * left_mem_merge = get_left_header(lastFencePost);
-        set_size(left_mem_merge, new_size);
-        
-        // update left_size for the right fencepost
-        header * new_right_fp = get_right_header(new_chunk);
-        new_right_fp->left_size = new_size;
-
-        if (last_old_block_size) {
-          left_mem_merge->left_size = last_block_in_old_mem->left_size;
-        }
-        else {
-          left_mem_merge->left_size = lastFencePost->left_size;
-        }
-
-        set_state(left_mem_merge, UNALLOCATED);
-
-        if (!moved_lists) {
-          size_t actual_size = get_size(left_mem_merge);
-          int new_idx = (actual_size / 8) - 3;
-          if (new_idx < 0) new_idx = 0;
+          int new_idx = (new_size / 8) - 3;
           if (new_idx >= N_LISTS) {
             new_idx = N_LISTS - 1;
           }
-          insert_header_to_freelist(left_mem_merge, new_idx);
+          insert_header_to_freelist(last_block, new_idx);
+
+          current = last_block;
         }
-        lastFencePost = right_fp;
-        current = left_mem_merge;
-      } 
-      else {// not adjacent
+        else { //already allocated, just do fencepost
+          header * new_block = lastFencePost;
+
+          new_size = ARENA_SIZE;
+
+          set_state(new_block, UNALLOCATED);
+          set_size (new_block, new_size);
+          new_block->left_size = get_size(last_block);
+
+          
+          right_fp->left_size = new_size;
+          lastFencePost = right_fp;
+
+          insert_header_to_freelist(new_block, N_LISTS - 1);
+          current = new_block;
+        }
+      }
+      else { //non-adjacent
         insert_header_to_freelist(new_chunk, N_LISTS - 1);
         insert_os_chunk(left_fp);
         lastFencePost = right_fp;
@@ -325,7 +299,7 @@ static inline header * allocate_object(size_t raw_size) {
 
 
   // we only split if leftover size is large enough to be another header
-  if (get_size(current) >= sizeof(header) + ALLOC_HEADER_SIZE + total_size) {
+  if (get_size(current) >= sizeof(header) + total_size) {
     //split object and initialize header fields
     size_t freeobjsize = get_size(current) - total_size;
     header * allocobj = get_header_from_offset(current, freeobjsize);
@@ -394,7 +368,7 @@ static inline void deallocate_object(void * p) {
   // get header of memory to deallocate (check for double free before unallocating)
   header * header_to_dealloc = get_header_from_offset((char *)p, -ALLOC_HEADER_SIZE);
   if (get_state(header_to_dealloc) == UNALLOCATED) {
-    fprintf(stderr, "\nDouble Free Detected\ntest_double_free: ../myMalloc.c:577: deallocate_object: Assertion `false' failed.\n");
+    fprintf(stderr, "Double Free Detected\ntest_double_free: ../myMalloc.c:577: deallocate_object: Assertion `false' failed.\n");
     _exit(1);
   }
   set_state(header_to_dealloc, UNALLOCATED);
